@@ -1,4 +1,6 @@
 import joblib as jl
+import os
+import json
 import firebase_admin
 from firebase_admin import credentials, firestore
 from flask import Flask, request, jsonify
@@ -14,9 +16,13 @@ def predict_category(text):
 
 # -------- Firebase Setup --------
 if not firebase_admin._apps:
-    cred = credentials.Certificate(
-        'smart-expense-tracking-s-4a1c6-firebase-adminsdk-fbsvc-393a0a7e1a.json'
-    )
+    # Get JSON from environment variable
+    cred_json = os.environ.get("FIREBASE_JSON")
+    if not cred_json:
+        raise ValueError("FIREBASE_JSON environment variable not set")
+
+    cred_dict = json.loads(cred_json)
+    cred = credentials.Certificate(cred_dict)
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
