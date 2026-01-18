@@ -7,8 +7,8 @@ from flask import Flask, request, jsonify
 from datetime import datetime
 
 # -------- Load ML Models --------
-embedder = jl.load('embedder.pkl')
-model = jl.load('model.pkl')
+embedder = jl.load('backend/embedder.pkl')
+model = jl.load('backend/model.pkl')
 
 def predict_category(text):
     vec = embedder.encode([text])
