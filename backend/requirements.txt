@@ -10,3 +10,5 @@ matplotlib==3.10.8
 numpy==2.3.3
 python-dateutil==2.9.0.post0
 requests==2.32.5
+sentence-transformers
+flask-cors
