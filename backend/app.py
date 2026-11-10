@@ -1,182 +1,463 @@
-import joblib as jl
+
 import os
-import json
+import joblib
 import firebase_admin
+
+from sentence_transformers import SentenceTransformer
 from firebase_admin import credentials, firestore
 from flask import Flask, request, jsonify
 from datetime import datetime
 
-# -------- Load ML Models --------
-embedder = jl.load('backend/embedder_compressed.pkl')
-model = jl.load('backend/model_compressed.pkl')
+# ==========================================
+# PATH CONFIGURATION
+# ==========================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# ==========================================
+# LOAD ML MODELS
+# ==========================================
+
+print("Loading embedding model...")
+
+embedder = SentenceTransformer(
+    "sentence-transformers/paraphrase-mpnet-base-v2"
+)
+
+model = joblib.load(os.path.join(BASE_DIR, "model.pkl"))
+
+print("ML models loaded successfully!")
 
 def predict_category(text):
-    vec = embedder.encode([text])
-    return model.predict(vec)[0]
+    embeddings = embedder.encode([text])
+    prediction = model.predict(embeddings)[0]
+    return str(prediction)
 
-# -------- Firebase Setup --------
-if not firebase_admin._apps:
-    # Get JSON from environment variable
-    cred_json = os.environ.get("FIREBASE_JSON")
-    if not cred_json:
-        raise ValueError("FIREBASE_JSON environment variable not set")
 
-    cred_dict = json.loads(cred_json)
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred)
+# ==========================================
+# FIREBASE CONFIGURATION
+# ==========================================
+
+firebase_key = os.getenv("FIREBASE_CREDENTIALS")
+
+if not firebase_key or not os.path.isfile(firebase_key):
+    raise FileNotFoundError("Firebase credentials not configured")
+
+cred = credentials.Certificate(firebase_key)
 
 db = firestore.client()
-print("✅ Firebase connected")
 
-# -------- Flask App --------
+print("Firebase connected successfully!")
+
+
+# ==========================================
+# FLASK APPLICATION
+# ==========================================
+
 app = Flask(__name__)
 
-# ================= SIGNUP =================
+
+# ==========================================
+# HEALTH CHECK
+# ==========================================
+
+@app.route("/")
+def home():
+    return jsonify({
+        "message": "Smart Expense Tracker API is running",
+        "status": "success"
+    })
+
+
+# ==========================================
+# SIGNUP
+# ==========================================
+
 @app.route("/signup", methods=["POST"])
 def signup():
-    d = request.get_json()
 
-    email = d["email"]
-    password = d["password"]
-    dob = d.get("dob","")
-    gender = d.get("gender", "")
-    salary_day = d.get("salary_day",1)
+    try:
+        d = request.get_json(silent=True) or {}
 
-    if db.collection("users").document(email).get().exists:
-        return jsonify({"error":"User exists"})
+        email = d.get("email", "").strip().lower()
+        password = d.get("password", "")
+        dob = d.get("dob", "")
+        gender = d.get("gender", "")
+        salary_day = int(d.get("salary_day", 1))
 
-    username = email.split("@")[0]
+        if not email or not password:
+            return jsonify({"error": "Email and password are required"}), 400
 
-    db.collection("users").document(email).set({
-        "email":email,
-        "username":username,
-        "password":password,
-        "dob": dob,
-        "gender": gender,
-        "salary_day": salary_day
-    })
+        if not 1 <= salary_day <= 28:
+            return jsonify({"error": "Invalid salary day"}), 400
 
-    return jsonify({"message":"Signup success"})
+        user_ref = db.collection("users").document(email)
 
-# ================= LOGIN =================
+        if user_ref.get().exists:
+            return jsonify({"error": "User already exists"}), 409
+
+        username = email.split("@")[0]
+
+        user_ref.set({
+            "email": email,
+            "username": username,
+            "password": password,
+            "dob": dob,
+            "gender": gender,
+            "salary_day": salary_day
+        })
+
+        return jsonify({"message": "Signup success"}), 201
+
+    except Exception as e:
+        app.logger.exception("Signup error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# LOGIN
+# ==========================================
+
 @app.route("/login", methods=["POST"])
 def login():
-    d = request.get_json()
-    doc = db.collection("users").document(d["email"]).get()
 
-    if not doc.exists:
-        return jsonify({"error":"User not found"})
+    try:
+        d = request.get_json(silent=True) or {}
 
-    if doc.to_dict()["password"] != d["password"]:
-        return jsonify({"error":"Wrong password"})
+        email = d.get("email", "").strip().lower()
+        password = d.get("password", "")
 
-    return jsonify({"message":"Login success"})
+        if not email or not password:
+            return jsonify({"error": "Enter email and password"}), 400
 
-# ================= PROFILE =================
-@app.route("/profile/<email>")
+        doc = db.collection("users").document(email).get()
+
+        if not doc.exists:
+            return jsonify({"error": "User not found"}), 404
+
+        user = doc.to_dict()
+
+        if user.get("password") != password:
+            return jsonify({"error": "Wrong password"}), 401
+
+        return jsonify({"message": "Login success"})
+
+    except Exception as e:
+        app.logger.exception("Login error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# PROFILE
+# ==========================================
+
+@app.route("/profile/<path:email>")
 def profile(email):
-    doc=db.collection("users").document(email).get()
-    if not doc.exists:
-        return jsonify({"error":"User not found"})
-    return jsonify(doc.to_dict())
 
-# ================= SALARY SAVE =================
-@app.route("/salary_update",methods=["POST"])
+    try:
+        doc = db.collection("users").document(email).get()
+
+        if not doc.exists:
+            return jsonify({"error": "User not found"}), 404
+
+        return jsonify(doc.to_dict())
+
+    except Exception as e:
+        app.logger.exception("Profile error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# SALARY UPDATE
+# ==========================================
+
+@app.route("/salary_update", methods=["POST"])
 def salary_update():
-    d=request.get_json()
-    key=f'{d["email"]}_{d["month"]}_{d["year"]}'
-    db.collection("salaries").document(key).set(d)
-    return jsonify({"message":"Salary saved"})
 
-# ================= SALARY CHECK =================
-@app.route("/salary_check/<key>")
+    try:
+        d = request.get_json(silent=True) or {}
+
+        email = d.get("email")
+        month = d.get("month")
+        year = d.get("year")
+
+        if not email or not month or year is None:
+            return jsonify({"error": "Missing salary details"}), 400
+
+        key = f"{email}_{month}_{year}"
+
+        db.collection("salaries").document(key).set({
+            "email": email,
+            "month": month,
+            "year": int(year),
+            "salary": float(d.get("salary", 0)),
+            "savings": float(d.get("savings", 0))
+        })
+
+        return jsonify({"message": "Salary saved"})
+
+    except Exception as e:
+        app.logger.exception("Salary update error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# SALARY CHECK
+# ==========================================
+
+@app.route("/salary_check/<path:key>")
 def salary_check(key):
-    doc=db.collection("salaries").document(key).get()
-    return jsonify({"exists":doc.exists})
 
-# ================= GET SALARY =================
-@app.route("/salary_get/<email>/<month>/<year>")
-def salary_get(email,month,year):
-    key=f"{email}_{month}_{year}"
-    doc=db.collection("salaries").document(key).get()
-    if not doc.exists:
-        return jsonify({"exists":False})
-    data = doc.to_dict()
-    return jsonify({
-        "exists":True,
-        "salary":data["salary"],
-        "savings":data["savings"]
-    })
+    try:
+        doc = db.collection("salaries").document(key).get()
 
-# ================= INVESTMENT =================
-@app.route("/investment/<email>/<month>/<year>")
-def investment(email,month,year):
-    key=f"{email}_{month}_{year}"
-    s = db.collection("salaries").document(key).get()
-    if not s.exists:
-        return jsonify({"suggestion":"Update salary first"})
-    d = s.to_dict()
-    sal = d["salary"]
-    sav = d["savings"]
-    if sav < sal*0.1:
-        tip="Start emergency fund"
-    elif sav < sal*0.3:
-        tip="Start SIP mutual fund"
-    else:
-        tip="Stocks & ETFs"
-    return jsonify({"suggestion":tip})
+        return jsonify({"exists": doc.exists})
 
-# ================= ADD EXPENSE =================
-@app.route("/predict",methods=["POST"])
+    except Exception as e:
+        app.logger.exception("Salary check error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# GET SALARY
+# ==========================================
+
+@app.route("/salary_get/<path:email>/<month>/<year>")
+def salary_get(email, month, year):
+
+    try:
+        key = f"{email}_{month}_{year}"
+
+        doc = db.collection("salaries").document(key).get()
+
+        if not doc.exists:
+            return jsonify({"exists": False})
+
+        data = doc.to_dict()
+
+        return jsonify({
+            "exists": True,
+            "salary": data.get("salary", 0),
+            "savings": data.get("savings", 0)
+        })
+
+    except Exception as e:
+        app.logger.exception("Get salary error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# INVESTMENT SUGGESTION
+# ==========================================
+
+@app.route("/investment/<path:email>/<month>/<year>")
+def investment(email, month, year):
+
+    try:
+        key = f"{email}_{month}_{year}"
+
+        doc = db.collection("salaries").document(key).get()
+
+        if not doc.exists:
+            return jsonify({
+                "suggestion": "Update salary first"
+            })
+
+        d = doc.to_dict()
+
+        salary = float(d.get("salary", 0))
+        savings = float(d.get("savings", 0))
+
+        if salary <= 0:
+            tip = "Enter a valid salary first"
+
+        elif savings < salary * 0.1:
+            tip = "Start building an emergency fund"
+
+        elif savings < salary * 0.3:
+            tip = "Consider learning about SIP mutual funds"
+
+        else:
+            tip = "Explore diversified investment options"
+
+        return jsonify({"suggestion": tip})
+
+    except Exception as e:
+        app.logger.exception("Investment error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# ADD EXPENSE / ML PREDICTION
+# ==========================================
+
+@app.route("/predict", methods=["POST"])
 def add_expense():
-    d=request.get_json()
-    cat=predict_category(d["description"])
-    db.collection("expenses").add({
-        "email":d["email"],
-        "description":d["description"],
-        "amount":d["amount"],
-        "month":d["month"],
-        "category":cat
-    })
-    return jsonify({"category":cat})
 
-# ================= CATEGORY PIE =================
-@app.route("/category_pie/<email>")
+    try:
+        d = request.get_json(silent=True) or {}
+
+        email = d.get("email")
+        description = d.get("description", "").strip()
+        amount = d.get("amount")
+        month = d.get("month")
+
+        if not email or not description or amount is None or not month:
+            return jsonify({
+                "error": "All expense fields are required"
+            }), 400
+
+        amount = float(amount)
+
+        if amount <= 0:
+            return jsonify({"error": "Amount must be greater than zero"}), 400
+
+        # Predict category using MPNet
+        category = predict_category(description)
+
+        # Save expense to Firestore
+        db.collection("expenses").add({
+            "email": email,
+            "description": description,
+            "amount": amount,
+            "month": month,
+            "category": category,
+            "created_at": datetime.now().isoformat()
+        })
+
+        return jsonify({
+            "success": True,
+            "category": category,
+            "message": "Expense added successfully"
+        }), 200
+
+    except Exception as e:
+        app.logger.exception("Expense prediction/save error")
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
+# ==========================================
+# CATEGORY PIE CHART
+# ==========================================
+
+@app.route("/category_pie/<path:email>")
 def pie(email):
-    exp=db.collection("expenses").where("email","==",email).stream()
-    res={}
-    for e in exp:
-        d=e.to_dict()
-        res[d["category"]] = res.get(d["category"],0) + d["amount"]
-    out = [{"category":k,"amount":v} for k,v in res.items()]
-    return jsonify(out)
 
-# ================= GRAPH =================
-@app.route("/graph/<email>")
+    try:
+        expenses = db.collection("expenses").where(
+            "email", "==", email
+        ).stream()
+
+        result = {}
+
+        for expense in expenses:
+
+            d = expense.to_dict()
+
+            category = d.get("category", "Other")
+            amount = float(d.get("amount", 0))
+
+            result[category] = result.get(category, 0) + amount
+
+        output = [
+            {"category": k, "amount": v}
+            for k, v in result.items()
+        ]
+
+        return jsonify(output)
+
+    except Exception as e:
+        app.logger.exception("Pie chart error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# MONTHLY EXPENSE GRAPH
+# ==========================================
+
+@app.route("/graph/<path:email>")
 def graph(email):
-    exp=db.collection("expenses").where("email","==",email).stream()
-    res={}
-    for e in exp:
-        d=e.to_dict()
-        res[d["month"]] = res.get(d["month"],0) + d["amount"]
-    out = [{"month":k,"amount":v} for k,v in res.items()]
-    return jsonify(out)
 
-# ================= AUTO ALERT =================
-@app.route("/auto_alert/<email>/<month>")
+    try:
+        expenses = db.collection("expenses").where(
+            "email", "==", email
+        ).stream()
+
+        result = {}
+
+        for expense in expenses:
+
+            d = expense.to_dict()
+
+            month = d.get("month")
+            amount = float(d.get("amount", 0))
+
+            result[month] = result.get(month, 0) + amount
+
+        output = [
+            {"month": k, "amount": v}
+            for k, v in result.items()
+        ]
+
+        return jsonify(output)
+
+    except Exception as e:
+        app.logger.exception("Graph error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# AUTOMATIC SPENDING ALERT
+# ==========================================
+
+@app.route("/auto_alert/<path:email>/<month>")
 def auto_alert(email, month):
-    key = f"{email}_{month}_{datetime.now().year}"
-    sal_doc = db.collection("salaries").document(key).get()
-    if not sal_doc.exists:
-        return jsonify({"alert": ""})
-    salary = sal_doc.to_dict()["salary"]
-    exp = db.collection("expenses").where("email","==",email).where("month","==",month).stream()
-    total = sum(e.to_dict()["amount"] for e in exp)
-    if total > salary * 0.8:
-        return jsonify({"alert":"⚠ Overspending detected!"})
-    return jsonify({"alert":""})
 
-# ================= RUN =================
+    try:
+        key = f"{email}_{month}_{datetime.now().year}"
+
+        salary_doc = db.collection("salaries").document(key).get()
+
+        if not salary_doc.exists:
+            return jsonify({"alert": ""})
+
+        salary = float(salary_doc.to_dict().get("salary", 0))
+
+        expenses = db.collection("expenses").where(
+            "email", "==", email
+        ).where(
+            "month", "==", month
+        ).stream()
+
+        total = sum(
+            float(e.to_dict().get("amount", 0))
+            for e in expenses
+        )
+
+        if salary > 0 and total > salary * 0.8:
+            return jsonify({
+                "alert": "⚠ Overspending detected!"
+            })
+
+        return jsonify({"alert": ""})
+
+    except Exception as e:
+        app.logger.exception("Auto alert error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# RUN SERVER
+# ==========================================
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # fallback to 5000 for local testing
-    app.run(host="0.0.0.0", port=port)
+    app.run(
+        host="127.0.0.1",
+        port=5000,
+        debug=True,
+        use_reloader=False
+    )
+
